@@ -1,20 +1,14 @@
 use std::collections::HashMap;
-use std::iter::{self, once};
-use std::{collections::HashSet, fs::OpenOptions};
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::iter::once;
 
 use clap::Parser;
-use fixed::traits::{LossyInto, ToFixed};
+use fixed::traits::ToFixed;
 use fixed::types::I16F16;
-use float_ord::FloatOrd;
-use image::{GrayImage, Luma};
-use imageproc::drawing::draw_hollow_polygon_mut;
-use imageproc::{
-    drawing::{draw_filled_rect_mut, draw_polygon_mut},
-    point::Point,
-    rect::Rect,
-};
 use nalgebra::{Vector2, Vector3};
-use stl_io::{IndexedMesh, IndexedTriangle, Vertex};
+use stl_io::{IndexedMesh, IndexedTriangle};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -23,13 +17,16 @@ struct Args {
     output: String,
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let cli = Args::parse();
+    // TODO get config path from cli and read from file
+    let config = Config::default();
 
-    match read_stl_file(&cli.input) {
-        Ok(mesh) => slice_mesh(&mesh),
-        Err(e) => println!("Failed to read input file: {:?}", e),
-    }
+    let mesh = read_stl_file(&cli.input)?;
+    let mut output = File::create(&cli.output)?;
+    slice_mesh(&mesh, &config, &mut output)?;
+
+    Ok(())
 }
 
 fn read_stl_file(path: &str) -> std::io::Result<IndexedMesh> {
@@ -50,10 +47,28 @@ struct Plane {
 
 struct Config {
     layer_height: I16F16,
+    nozzle_diameter: I16F16,
+    infill_percent: I16F16,
+    filament_diameter: I16F16,
+    wall_count: usize,
     // TODO temperatures
 }
 
-fn slice_mesh(mesh: &IndexedMesh) {
+impl Config {
+    fn default() -> Self {
+        Config {
+            layer_height: 0.2.to_fixed(),
+            nozzle_diameter: 0.4.to_fixed(),
+            infill_percent: 0.3.to_fixed(),
+            filament_diameter: 1.75.to_fixed(),
+
+            wall_count: 3,
+        }
+    }
+}
+
+fn slice_mesh(mesh: &IndexedMesh, config: &Config, output: &mut File) -> std::io::Result<()> {
+    output.write_all(&init_gcode().as_bytes())?;
     let triangles: Vec<_> = mesh
         .faces
         .iter()
@@ -67,7 +82,7 @@ fn slice_mesh(mesh: &IndexedMesh) {
         .flatten()
         .max()
         .unwrap();
-    let layer_height: I16F16 = 1.to_fixed();
+    let layer_height: I16F16 = config.layer_height;
     let eps = 0.05.to_fixed();
     let mut slice_plane = Plane {
         normal: Vector3::new(0.to_fixed(), 0.to_fixed(), (-1).to_fixed()),
@@ -75,7 +90,7 @@ fn slice_mesh(mesh: &IndexedMesh) {
     };
     let layers: u32 = (max_height / layer_height).to_num();
     for layer in 0..layers {
-        //for layer in 2..3 {
+        //for layer in 0..1 {
         slice_plane.distance = layer_height * layer.to_fixed::<I16F16>();
         let intersections: Vec<Intersection> = triangles
             .iter()
@@ -88,8 +103,17 @@ fn slice_mesh(mesh: &IndexedMesh) {
         //    print!("{}", point);
         //}
         let outline_points = polygon_order_points(intersections);
-        write_layer_image(layer, &outline_points);
+        //write_layer_image(layer, &outline_points);
+        let infill_percent = if layer < 3 || layer > layers - 3 {
+            1.to_fixed()
+        } else {
+            config.infill_percent
+        };
+        let gcode = layer_gcode(&outline_points, infill_percent, config);
+        output.write_all(&format!("G0 Z{}\n", slice_plane.distance).as_bytes())?;
+        output.write_all(gcode.as_bytes())?;
     }
+    Ok(())
 }
 
 // find duplicates points and add their normals together
@@ -112,44 +136,70 @@ fn merge_duplicate_intersections(intersects: Vec<Intersection>) -> Vec<Intersect
         .collect()
 }
 
-fn write_layer_image(layer: u32, points: &[Intersection]) {
-    let image_size = 600;
-    let mut image = GrayImage::new(image_size, image_size);
-    // Fill image with white
-    for i in 0..image_size {
-        for j in 0..image_size {
-            image.put_pixel(i, j, image::Luma([255]))
+fn init_gcode() -> String {
+    let mut output = String::new();
+    // TODO set temps
+    // TODO skirt? brim? raft?
+    // TODO set mode = absolute
+    // TODO set extruder relative mode
+    output.push_str("; init gcode will go here\n");
+    output
+}
+
+fn layer_gcode(outline_points: &[Intersection], infill_percent: I16F16, config: &Config) -> String {
+    // TODO move points config.nozzle_diameter / 2 into the middle so the outer edge of the result
+    // is in the right place
+    let mut output = String::new();
+
+    // TODO don't print 3 layers of walls when they're close to each other
+    for i in 0..config.wall_count {
+        output.push_str(&format!("; start outer wall {}\n", i));
+        let wall_points: Vec<_> = outline_points
+            .iter()
+            .map(|intersect| {
+                point_away_from_normal(
+                    intersect,
+                    (config.nozzle_diameter / 2.to_fixed::<I16F16>())
+                        + config.nozzle_diameter * i.to_fixed::<I16F16>(),
+                )
+            })
+            .collect();
+        output.push_str(&format!("G0 X{} Y{}\n", wall_points[0].x, wall_points[0].y));
+        for i in 0..wall_points.len() {
+            let start = wall_points[i];
+            let end = wall_points[(i + 1) % wall_points.len()];
+            let extrusion_distance = extrusion_distance(start, end, config);
+
+            // assume nozzle is already at start
+            output.push_str(&format!(
+                "G1 E{} X{} Y{}\n",
+                extrusion_distance, end.x, end.y
+            ));
         }
-    }
-    draw_filled_rect_mut(
-        &mut image,
-        Rect::at(0, 0).of_size(image_size, image_size),
-        image::Luma([255]),
-    );
-
-    let image_points: Vec<Point<f32>> = points
-        .iter()
-        .map(|i| {
-            let x: f32 = (i.point.x * I16F16::from_num(25)).lossy_into();
-            let y: f32 = (i.point.y * I16F16::from_num(25)).lossy_into();
-            Point::new(x + 300., y + 300.)
-        })
-        .collect();
-
-    draw_hollow_polygon_mut(&mut image, &image_points, image::Luma([0]));
-    image.save(format!("layers/layer_{}.png", layer)).unwrap();
-}
-
-/*
-fn layer_gcode(outline_points: &[Vector2[I16F16]]) -> String {
-    let mut outline_segments = Vec::new();
-    for i in 0..outline_points.len() {
-        let j = i + 1 % outline_points.len();
-        outline_segments
+        output.push_str(&format!("; end outer wall {}\n\n", i));
     }
 
+    // TODO infill
+
+    output
 }
-*/
+
+fn extrusion_distance(a: Vector2<I16F16>, b: Vector2<I16F16>, config: &Config) -> I16F16 {
+    let diff = b - a;
+    let line_length = (diff.x * diff.x + diff.y * diff.y).sqrt();
+    let volume = config.layer_height * config.nozzle_diameter * line_length;
+    let filament_crosssection_area = (config.filament_diameter / 2)
+        * (config.filament_diameter / 2)
+        * std::f32::consts::PI.to_fixed::<I16F16>();
+    volume / filament_crosssection_area
+}
+
+fn point_away_from_normal(intersect: &Intersection, dist: I16F16) -> Vector2<I16F16> {
+    let transform = intersect.normal.clone();
+    let normalized = transform / (transform.x * transform.x + transform.y * transform.y).sqrt();
+    let transform = -normalized * dist;
+    intersect.point + transform
+}
 
 fn polygon_order_points(mut intersects: Vec<Intersection>) -> Vec<Intersection> {
     intersects.sort_by_key(|p| p.point.x);
