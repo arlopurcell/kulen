@@ -1,12 +1,12 @@
+use itertools::Itertools;
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::iter::{once, successors};
+use std::iter::once;
 
 use clap::Parser;
-use fixed::traits::Fixed;
 use fixed::traits::ToFixed;
 use fixed::types::I16F16;
 use nalgebra::{Vector2, Vector3};
@@ -54,6 +54,10 @@ struct Config {
     filament_diameter: I16F16,
     wall_count: usize,
     // TODO temperatures
+    standby_nozzle_temp: u32,
+    printing_nozzle_temp: u32,
+    bed_temp: u32,
+
     build_volume: Vector3<I16F16>,
 }
 
@@ -67,13 +71,17 @@ impl Config {
 
             wall_count: 3,
 
-            build_volume: Vector3::new(20.to_fixed(), 20.to_fixed(), 20.to_fixed()),
+            standby_nozzle_temp: 175,
+            printing_nozzle_temp: 200,
+            bed_temp: 60,
+
+            build_volume: Vector3::new(220.to_fixed(), 220.to_fixed(), 250.to_fixed()),
         }
     }
 }
 
 fn slice_mesh(mesh: &IndexedMesh, config: &Config, output: &mut File) -> std::io::Result<()> {
-    output.write_all(&init_gcode().as_bytes())?;
+    output.write_all(&init_gcode(config).as_bytes())?;
     let triangles: Vec<_> = mesh
         .faces
         .iter()
@@ -98,9 +106,11 @@ fn slice_mesh(mesh: &IndexedMesh, config: &Config, output: &mut File) -> std::io
         distance: 0.to_fixed(),
     };
     let layers: u32 = (max_height / layer_height).to_num();
-    for layer in 0..layers {
-        //for layer in 0..1 {
-        slice_plane.distance = layer_height * layer.to_fixed::<I16F16>();
+    output.write_all(&format!(";LAYER_COUNT:{}\n", layers).as_bytes())?;
+    let mut extruder_position = 0.to_fixed();
+    for layer in 1..layers {
+        //for layer in 1..2 {
+        slice_plane.distance = layer_height * (layer).to_fixed::<I16F16>();
         let intersections: Vec<Intersection> = triangles
             .iter()
             .map(|triange| triangle_plane_intersection(triange, &slice_plane, &eps))
@@ -118,11 +128,17 @@ fn slice_mesh(mesh: &IndexedMesh, config: &Config, output: &mut File) -> std::io
         } else {
             config.infill_percent
         };
-        output.write_all(&format!("; layer {}\n", layer).as_bytes())?;
-        output.write_all(&format!("G0 Z{}\n", slice_plane.distance).as_bytes())?;
-        let gcode = layer_gcode(layer, &outline_points, infill_percent, config);
+        output.write_all(&format!("G0 F1200 Z{}\n", slice_plane.distance).as_bytes())?;
+        let gcode = layer_gcode(
+            layer,
+            &outline_points,
+            infill_percent,
+            config,
+            &mut extruder_position,
+        );
         output.write_all(gcode.as_bytes())?;
     }
+    output.write_all(&finish_gcode(config).as_bytes())?;
     Ok(())
 }
 
@@ -132,12 +148,12 @@ fn center_triangles(triangles: Vec<Triangle>) -> Vec<Triangle> {
     triangles
         .into_iter()
         .map(|mut triangle| {
-            triangle.points[0].x += 15.to_fixed::<I16F16>();
-            triangle.points[0].y += 15.to_fixed::<I16F16>();
-            triangle.points[1].x += 15.to_fixed::<I16F16>();
-            triangle.points[1].y += 15.to_fixed::<I16F16>();
-            triangle.points[2].x += 15.to_fixed::<I16F16>();
-            triangle.points[2].y += 15.to_fixed::<I16F16>();
+            triangle.points[0].x += 110.to_fixed::<I16F16>();
+            triangle.points[0].y += 110.to_fixed::<I16F16>();
+            triangle.points[1].x += 110.to_fixed::<I16F16>();
+            triangle.points[1].y += 110.to_fixed::<I16F16>();
+            triangle.points[2].x += 110.to_fixed::<I16F16>();
+            triangle.points[2].y += 110.to_fixed::<I16F16>();
 
             triangle
         })
@@ -164,13 +180,55 @@ fn merge_duplicate_intersections(intersects: Vec<Intersection>) -> Vec<Intersect
         .collect()
 }
 
-fn init_gcode() -> String {
+fn init_gcode(config: &Config) -> String {
     let mut output = String::new();
-    // TODO set temps
     // TODO skirt? brim? raft?
-    // TODO set mode = absolute
-    // TODO set extruder relative mode
-    output.push_str("; init gcode will go here\n");
+    output.push_str("; Haxaw Start G-code\n");
+    output.push_str("G92 E0 ; Reset Extruder\n");
+    output.push_str("G28 ; Home all axes\n");
+    output.push_str("G1 Z5.0 F3000 ; Move Z Axis up a bit during heating to not damage bed\n");
+    output.push_str(&format!(
+        "M104 S{} ; Start heating up the nozzle most of the way\n",
+        config.standby_nozzle_temp
+    ));
+    output.push_str(&format!(
+        "M190 S{} ; Start heating the bed, wait until target temperature reached\n",
+        config.bed_temp
+    ));
+    output.push_str(&format!(
+        "M109 S{} ; Finish heating the nozzle\n",
+        config.printing_nozzle_temp
+    ));
+    output.push_str("G1 Z2.0 F3000 ; Move Z Axis up little to prevent scratching of Heat Bed\n");
+    output.push_str("G1 X0.1 Y20 Z0.3 F5000.0 ; Move to start position\n");
+    output.push_str("G1 X0.1 Y200.0 Z0.3 F1500.0 E15 ; Draw the first line\n");
+    output.push_str("G1 X0.4 Y200.0 Z0.3 F5000.0 ; Move to side a little\n");
+    output.push_str("G1 X0.4 Y20 Z0.3 F1500.0 E30 ; Draw the second line\n");
+    output.push_str("G92 E0 ; Reset Extruder\n");
+    output.push_str("G1 Z2.0 F3000 ; Move Z Axis up little to prevent scratching of Heat Bed\n");
+    output.push_str("G1 X5 Y20 Z0.3 F5000.0 ; Move over to prevent blob squish\n");
+    output.push_str("M106 S85 ; Turn on fan\n");
+    output
+}
+
+fn finish_gcode(config: &Config) -> String {
+    let mut output = String::new();
+    output.push_str("G91 ;Relative positioning\n");
+    output.push_str("G1 E-2 F2700 ;Retract a bit\n");
+    output.push_str("G1 E-2 Z0.2 F2400 ;Retract and raise Z\n");
+    output.push_str("G1 X5 Y5 F3000 ;Wipe out\n");
+    output.push_str("G1 Z10 ;Raise Z more\n");
+    output.push_str("G90 ;Absolute positioning\n");
+    output.push_str("\n");
+    output.push_str(&format!(
+        "G1 X0 Y{} ;Present print\n",
+        config.build_volume.y
+    ));
+    output.push_str("M106 S0 ;Turn-off fan\n");
+    output.push_str("M104 S0 ;Turn-off hotend\n");
+    output.push_str("M140 S0 ;Turn-off bed\n");
+    output.push_str("\n");
+    output.push_str("M84 X Y E ;Disable all steppers but Z\n");
     output
 }
 
@@ -179,16 +237,21 @@ fn layer_gcode(
     outline_points: &[Intersection],
     infill_percent: I16F16,
     config: &Config,
+    extruder_position: &mut I16F16,
 ) -> String {
     let mut output = String::new();
-
+    output.push_str(&format!(";LAYER:{}\n", layer));
     // TODO don't print 3 layers of walls when they're close to each other
     // do this by checking whether each wall point is inside the previous wall polygon and discard
     // if not
     let mut prev_wall: Option<Vec<[Vector2<I16F16>; 2]>> = None;
     let ray_direction: Vector2<I16F16> = Vector2::new(1.to_fixed(), 0.to_fixed());
     for i in 0..config.wall_count {
-        output.push_str(&format!("; start outer wall {}\n", i));
+        output.push_str(if i == 0 {
+            ";TYPE:WALL-OUTER\n"
+        } else {
+            ";TYPE:WALL-INNER\n"
+        });
         //println!("wall {}: prev_wall: {:?}", i, prev_wall);
         let wall_points: Vec<_> = outline_points
             .iter()
@@ -243,21 +306,57 @@ fn layer_gcode(
         output.push_str(&format!("G0 X{} Y{}\n", wall_points[0].x, wall_points[0].y));
         for [start, end] in wall_lines.iter() {
             let extrusion_distance = extrusion_distance(start, end, config);
+            *extruder_position += extrusion_distance;
 
             // assume nozzle is already at start
             output.push_str(&format!(
                 "G1 E{} X{} Y{}\n",
-                extrusion_distance, end.x, end.y
+                extruder_position, end.x, end.y
             ));
         }
-        output.push_str(&format!("; end outer wall {}\n\n", i));
+        //output.push_str(&format!("; end inner wall {}\n\n", i));
         prev_wall = Some(wall_lines);
     }
 
-    // TODO infill
-    //if layer % 2 == 0 {
-    //    successors(Some(Vector2::new(0.to_fixed(), 0.to_fixed())), |prev| Some(prev +))
-    //}
+    // infill
+    output.push_str(";TYPE:FILL\n");
+    let unit_x: Vector2<I16F16> = Vector2::new(1.to_fixed(), 0.to_fixed());
+    let unit_y: Vector2<I16F16> = Vector2::new(0.to_fixed(), 1.to_fixed());
+    let (ray_direction, ray_origin_base) = if layer % 2 == 0 {
+        (unit_y, unit_x)
+    } else {
+        (unit_x, unit_y)
+    };
+    let ray_origins = (0..)
+        .map(|i| ray_origin_base * config.nozzle_diameter / infill_percent * i.to_fixed())
+        .take_while(|point| point.x < config.build_volume.x && point.y < config.build_volume.y)
+        .collect_vec();
+    //println!("infill ray origins: {}", ray_origins.len());
+    for ray_origin in ray_origins {
+        let mut intersects: Vec<_> = prev_wall
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|[segment_start, segment_end]| {
+                ray_intersect_segment(&ray_origin, &ray_direction, segment_start, segment_end)
+            })
+            .flatten()
+            .collect();
+        intersects.sort_by_key(|point| point.y);
+        //println!("intersect count: {}", intersects.len());
+        assert!(intersects.len() % 2 == 0);
+        let mut intersect_iter = intersects.iter();
+        while let Some((start, end)) = intersect_iter.next_tuple() {
+            //println!("start, end = {}, {}", start, end);
+            output.push_str(&format!("G0 X{} Y{}\n", start.x, start.y));
+            let extrusion_distance = extrusion_distance(start, end, config);
+            *extruder_position += extrusion_distance;
+            output.push_str(&format!(
+                "G1 E{} X{} Y{}\n",
+                extruder_position, end.x, end.y
+            ));
+        }
+    }
 
     output
 }
