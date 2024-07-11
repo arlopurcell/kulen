@@ -48,27 +48,17 @@ fn slice_triangles(
     let triangles = center_triangles(triangles, config);
     //println!("triangle {:?}", triangles);
 
-    let max_height = triangles
-        .iter()
-        .map(|t| t.points.iter().map(|point| point.z))
-        .flatten()
-        .max()
-        .unwrap();
-
-    // TODO check that it fits in build volume
-    // this probably means moving the object to the center of the build area?
-    let layer_height: I16F16 = config.layer_height;
-    let eps = 0.05.to_fixed();
+    let layer_count = count_layers(&triangles, config.layer_height);
+    output.write_all(&format!(";LAYER_COUNT:{}\n", layer_count).as_bytes())?;
+    let mut extruder_position = 0.to_fixed();
     let mut slice_plane = Plane {
         normal: Vector3::new(0.to_fixed(), 0.to_fixed(), (-1).to_fixed()),
         distance: 0.to_fixed(),
     };
-    let layers: u32 = (max_height / layer_height).to_num();
-    output.write_all(&format!(";LAYER_COUNT:{}\n", layers).as_bytes())?;
-    let mut extruder_position = 0.to_fixed();
-    for layer in 1..layers {
+    let eps: I16F16 = 0.05.to_fixed();
+    for layer in 1..layer_count {
         //for layer in 1..2 {
-        slice_plane.distance = layer_height * (layer).to_fixed::<I16F16>();
+        slice_plane.distance = config.layer_height * (layer).to_fixed::<I16F16>();
         let intersections: Vec<Intersection> = triangles
             .iter()
             .map(|triange| triangle_plane_intersection(triange, &slice_plane, &eps))
@@ -80,8 +70,9 @@ fn slice_triangles(
         //    print!("{}", point);
         //}
         let outline_points = polygon_order_points(intersections);
-        //write_layer_image(layer, &outline_points);
-        let infill_percent = if layer < 3 || layer > layers - 3 {
+        let infill_percent = if layer < (config.wall_layers as u32)
+            || layer > layer_count - (config.wall_layers as u32)
+        {
             1.to_fixed()
         } else {
             config.infill_percent
@@ -98,6 +89,18 @@ fn slice_triangles(
     }
     output.write_all(&finish_gcode(config).as_bytes())?;
     Ok(())
+}
+
+fn count_layers(triangles: &[Triangle], layer_height: I16F16) -> u32 {
+    let max_height = triangles
+        .iter()
+        .map(|t| t.points.iter().map(|point| point.z))
+        .flatten()
+        .max()
+        .unwrap();
+
+    // TODO check that it fits in build volume
+    (max_height / layer_height).to_num()
 }
 
 fn center_triangles(triangles: Vec<Triangle>, config: &Config) -> Vec<Triangle> {
@@ -201,9 +204,6 @@ fn layer_gcode(
 ) -> String {
     let mut output = String::new();
     output.push_str(&format!(";LAYER:{}\n", layer));
-    // TODO don't print 3 layers of walls when they're close to each other
-    // do this by checking whether each wall point is inside the previous wall polygon and discard
-    // if not
     let mut prev_wall: Option<Vec<[Vector2<I16F16>; 2]>> = None;
     let ray_direction: Vector2<I16F16> = Vector2::new(1.to_fixed(), 0.to_fixed());
     for i in 0..config.wall_count {
@@ -223,30 +223,24 @@ fn layer_gcode(
                 )
             })
             .filter(|point| {
-                // Filter out points that are within nozzle_diameter / 2 of the previous wall
                 if let Some(prev_wall) = &prev_wall {
+                    // Filter out points that are within nozzle_diameter / 2 of the previous wall
                     prev_wall.iter().all(|[start, end]| {
                         point_segment_distance(start, end, point) >= config.nozzle_diameter / 2
-                    })
-                } else {
-                    true
-                }
-            })
-            .filter(|point| {
-                // Filter out points that are not inside the previous wall's polygon
-                if let Some(prev_wall) = &prev_wall {
-                    // Count number of sides a ray coming out of the point intersects
-                    let intersect_count = prev_wall
-                        .iter()
-                        .map(|[start, end]| {
-                            ray_intersect_segment(point, &ray_direction, start, end).is_some()
-                        })
-                        .filter(|b| *b)
-                        .count();
-                    //println!("point {}, intersect_count: {}", point, intersect_count);
+                    }) && {
+                        // Filter out points that are not inside the previous wall's polygon
+                        let intersect_count = prev_wall
+                            .iter()
+                            .map(|[start, end]| {
+                                ray_intersect_segment(point, &ray_direction, start, end).is_some()
+                            })
+                            .filter(|b| *b)
+                            .count();
+                        //println!("point {}, intersect_count: {}", point, intersect_count);
 
-                    // it's inside the polygon if the count is odd
-                    intersect_count % 2 == 1
+                        // it's inside the polygon if the count is odd
+                        intersect_count % 2 == 1
+                    }
                 } else {
                     true
                 }
@@ -278,8 +272,27 @@ fn layer_gcode(
         prev_wall = Some(wall_lines);
     }
 
-    // infill
-    output.push_str(";TYPE:FILL\n");
+    // TODO match config.infill_type
+    infill_layer_lines(
+        layer,
+        prev_wall.as_ref().unwrap(),
+        infill_percent,
+        extruder_position,
+        config,
+        &mut output,
+    );
+
+    output
+}
+
+fn infill_layer_lines(
+    layer: u32,
+    prev_wall: &[[Vector2<I16F16>; 2]],
+    infill_percent: I16F16,
+    extruder_position: &mut I16F16,
+    config: &Config,
+    output: &mut String,
+) {
     let unit_x: Vector2<I16F16> = Vector2::new(1.to_fixed(), 0.to_fixed());
     let unit_y: Vector2<I16F16> = Vector2::new(0.to_fixed(), 1.to_fixed());
     let (ray_direction, ray_origin_base) = if layer % 2 == 0 {
@@ -287,15 +300,53 @@ fn layer_gcode(
     } else {
         (unit_x, unit_y)
     };
-    let ray_origins = (0..)
+    let rays = (0..)
         .map(|i| ray_origin_base * config.nozzle_diameter / infill_percent * i.to_fixed())
         .take_while(|point| point.x < config.build_volume.x && point.y < config.build_volume.y)
+        .map(|ray_origin| [ray_origin, ray_direction])
         .collect_vec();
-    //println!("infill ray origins: {}", ray_origins.len());
-    for ray_origin in ray_origins {
+    infill_layer(&rays, prev_wall, extruder_position, config, output);
+}
+
+fn infill_layer_grid(
+    prev_wall: &[[Vector2<I16F16>; 2]],
+    infill_percent: I16F16,
+    extruder_position: &mut I16F16,
+    config: &Config,
+    output: &mut String,
+) {
+    let unit_x: Vector2<I16F16> = Vector2::new(1.to_fixed(), 0.to_fixed());
+    let unit_y: Vector2<I16F16> = Vector2::new(0.to_fixed(), 1.to_fixed());
+
+    let vert_rays = (0..)
+        .map(|i| unit_x * config.nozzle_diameter / infill_percent * i.to_fixed() * 2.to_fixed())
+        .take_while(|point| point.x < config.build_volume.x && point.y < config.build_volume.y)
+        .map(|ray_origin| [ray_origin, unit_y])
+        .collect_vec();
+    let horiz_rays = (0..)
+        .map(|i| unit_y * config.nozzle_diameter / infill_percent * i.to_fixed() * 2.to_fixed())
+        .take_while(|point| point.x < config.build_volume.x && point.y < config.build_volume.y)
+        .map(|ray_origin| [ray_origin, unit_x])
+        .collect_vec();
+    let rays = vert_rays
+        .into_iter()
+        .chain(horiz_rays.into_iter())
+        .collect_vec();
+
+    infill_layer(&rays, prev_wall, extruder_position, config, output);
+}
+
+fn infill_layer(
+    rays: &[[Vector2<I16F16>; 2]],
+    prev_wall: &[[Vector2<I16F16>; 2]],
+    extruder_position: &mut I16F16,
+    config: &Config,
+    output: &mut String,
+) {
+    output.push_str(";TYPE:FILL\n");
+    for ray in rays {
+        let [ray_origin, ray_direction] = ray;
         let mut intersects: Vec<_> = prev_wall
-            .as_ref()
-            .unwrap()
             .iter()
             .map(|[segment_start, segment_end]| {
                 ray_intersect_segment(&ray_origin, &ray_direction, segment_start, segment_end)
@@ -317,8 +368,6 @@ fn layer_gcode(
             ));
         }
     }
-
-    output
 }
 
 fn extrusion_distance(a: &Vector2<I16F16>, b: &Vector2<I16F16>, config: &Config) -> I16F16 {

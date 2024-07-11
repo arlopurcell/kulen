@@ -12,6 +12,7 @@ pub struct Config {
     pub layer_height: I16F16,
     pub infill_percent: I16F16,
     pub wall_count: usize,
+    pub wall_layers: usize,
 
     // Material settings
     pub standby_nozzle_temp: u32,
@@ -29,6 +30,7 @@ impl Config {
             layer_height: 0.2.to_fixed(),
             infill_percent: 0.3.to_fixed(),
             wall_count: 3,
+            wall_layers: 3,
 
             standby_nozzle_temp: 175,
             printing_nozzle_temp: 200,
